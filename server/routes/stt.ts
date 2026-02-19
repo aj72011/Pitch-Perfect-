@@ -54,13 +54,23 @@ export function attachSttWebSocket(server: http.Server) {
   });
 
   wss.on("connection", (clientWs: WebSocket) => {
-    const dgKey = getOptionalEnv("DEEPGRAM_API_KEY");
-    if (!dgKey) {
+    const sendClient = (payload: Record<string, unknown>) => {
       try {
-        clientWs.send(JSON.stringify({ type: "error", message: "DEEPGRAM_API_KEY missing" }));
+        clientWs.send(JSON.stringify(payload));
       } catch {
         // ignore
       }
+    };
+
+    const sendClientError = (message: string) => {
+      // eslint-disable-next-line no-console
+      console.error(`[STT] ${message}`);
+      sendClient({ type: "error", message });
+    };
+
+    const dgKey = getOptionalEnv("DEEPGRAM_API_KEY");
+    if (!dgKey) {
+      sendClientError("DEEPGRAM_API_KEY missing");
       clientWs.close();
       return;
     }
@@ -69,9 +79,30 @@ export function attachSttWebSocket(server: http.Server) {
     console.log("WS client connected");
 
     let dgWs: WebSocket | null = null;
+    let dgOpened = false;
+    let fatalErrorSent = false;
     const pendingChunks: Buffer[] = [];
     let pendingBytes = 0;
     const MAX_PENDING_BYTES = 2 * 1024 * 1024; // 2MB safety cap
+
+    const sendFatalAndClose = (message: string) => {
+      if (!fatalErrorSent) {
+        fatalErrorSent = true;
+        sendClientError(message);
+      }
+
+      try {
+        clientWs.close();
+      } catch {
+        // ignore
+      }
+
+      try {
+        dgWs?.close();
+      } catch {
+        // ignore
+      }
+    };
 
     dgWs = new WebSocket(deepgramUrl(), {
       headers: {
@@ -80,6 +111,7 @@ export function attachSttWebSocket(server: http.Server) {
     });
 
     dgWs.on("open", () => {
+      dgOpened = true;
       // eslint-disable-next-line no-console
       console.log("DG open");
 
@@ -95,11 +127,22 @@ export function attachSttWebSocket(server: http.Server) {
         pendingBytes = 0;
       }
 
-      try {
-        clientWs.send(JSON.stringify({ type: "stt-ready" }));
-      } catch {
-        // ignore
-      }
+      sendClient({ type: "stt-ready" });
+    });
+
+    (dgWs as any).on("unexpected-response", (_req: IncomingMessage, res: IncomingMessage) => {
+      let body = "";
+      res.on("data", (chunk: Buffer | string) => {
+        body += chunk.toString();
+      });
+      res.on("end", () => {
+        const message = `Deepgram handshake failed: ${res.statusCode ?? 0} ${res.statusMessage ?? ""} ${body}`.trim();
+        sendFatalAndClose(message);
+      });
+      res.on("error", () => {
+        const message = `Deepgram handshake failed: ${res.statusCode ?? 0} ${res.statusMessage ?? ""}`.trim();
+        sendFatalAndClose(message);
+      });
     });
 
     dgWs.on("message", (data: WebSocket.RawData) => {
@@ -112,32 +155,29 @@ export function attachSttWebSocket(server: http.Server) {
           const msg = typeof evt?.message === "string" ? evt.message : typeof evt?.error === "string" ? evt.error : str;
           // eslint-disable-next-line no-console
           console.log(`DG error payload: ${msg}`);
-          try {
-            clientWs.send(JSON.stringify({ type: "error", message: msg }));
-          } catch {
-            // ignore
-          }
-          try {
-            clientWs.close();
-          } catch {
-            // ignore
-          }
-          try {
-            dgWs?.close();
-          } catch {
-            // ignore
-          }
+          sendFatalAndClose(`Deepgram error payload: ${msg}`);
           return;
         }
 
         const alt = evt?.channel?.alternatives?.[0];
         const transcript: string = alt?.transcript || "";
-        const isFinal: boolean = Boolean(evt?.is_final || evt?.speech_final);
+        const isFinal: boolean = Boolean(evt?.is_final);
+        const speechFinal: boolean = Boolean(evt?.speech_final);
+        const rawConfidence = typeof alt?.confidence === "number" ? alt.confidence : Number.NaN;
+        const confidence = Number.isFinite(rawConfidence) ? rawConfidence : undefined;
 
         if (typeof transcript === "string" && transcript.trim().length > 0) {
           // eslint-disable-next-line no-console
-          console.log(`DG transcript: ${transcript} final=${isFinal}`);
-          clientWs.send(JSON.stringify({ type: "transcript", text: transcript, is_final: isFinal }));
+          console.log(`DG transcript: ${transcript} final=${isFinal} speech_final=${speechFinal} confidence=${confidence ?? "n/a"}`);
+          clientWs.send(
+            JSON.stringify({
+              type: "transcript",
+              text: transcript,
+              is_final: isFinal,
+              speech_final: speechFinal,
+              confidence,
+            })
+          );
         }
       } catch {
         // ignore
@@ -145,33 +185,22 @@ export function attachSttWebSocket(server: http.Server) {
     });
 
     dgWs.on("close", (code: number, reason: Buffer) => {
+      const reasonText = reason?.toString?.() || "";
       // eslint-disable-next-line no-console
-      console.log(`DG close code=${code} reason=${reason?.toString?.() || ""}`);
-      try {
-        clientWs.send(JSON.stringify({ type: "stt-closed" }));
-      } catch {
-        // ignore
+      console.log(`DG close code=${code} reason=${reasonText}`);
+      if (!fatalErrorSent && (!dgOpened || (code !== 1000 && code !== 1005))) {
+        const msg = `Deepgram socket closed before streaming was ready (code ${code}${reasonText ? `, reason: ${reasonText}` : ""})`;
+        sendClientError(msg);
+        fatalErrorSent = true;
       }
+      sendClient({ type: "stt-closed" });
     });
 
     dgWs.on("error", (err: Error) => {
+      const msg = `Deepgram websocket error: ${err.message || "Unknown error"}`;
       // eslint-disable-next-line no-console
       console.log(`DG error ${err.message}`);
-      try {
-        clientWs.send(JSON.stringify({ type: "error", message: err.message }));
-      } catch {
-        // ignore
-      }
-      try {
-        clientWs.close();
-      } catch {
-        // ignore
-      }
-      try {
-        dgWs?.close();
-      } catch {
-        // ignore
-      }
+      sendFatalAndClose(msg);
     });
 
     clientWs.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
@@ -220,7 +249,7 @@ export function attachSttWebSocket(server: http.Server) {
 
     clientWs.on("close", () => {
       // eslint-disable-next-line no-console
-      console.log("DG close");
+      console.log("Client WS close");
       try {
         dgWs?.close();
       } catch {
@@ -231,7 +260,7 @@ export function attachSttWebSocket(server: http.Server) {
 
     clientWs.on("error", () => {
       // eslint-disable-next-line no-console
-      console.log("DG error");
+      console.log("Client WS error");
     });
   });
 

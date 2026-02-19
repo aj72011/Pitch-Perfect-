@@ -47,6 +47,13 @@ type VcPersona = {
   style: string;
 };
 
+type VcReplyResult = {
+  text: string;
+  videoUrl?: string;
+};
+
+const AI_AVATAR_VIDEO_ID = "aiVideo";
+
 const vcPersonas: VcPersona[] = [
   { id: "shark", name: "The Shark", style: "Aggressive Silicon Valley VC" },
   { id: "analyst", name: "The Analyst", style: "Analytical Fintech Investor" },
@@ -201,7 +208,7 @@ function pickFirstSentence(text: string, maxLen: number): string {
   const t = normalizeText(text);
   if (!t) return "unknown";
   const sentence = t.split(/(?<=[.!?])\s+/)[0] ?? t;
-  return sentence.length > maxLen ? `${sentence.slice(0, maxLen).trim()}…` : sentence;
+  return sentence.length > maxLen ? `${sentence.slice(0, maxLen).trim()}...` : sentence;
 }
 
 function findSnippet(allText: string, regex: RegExp, maxLen: number): string {
@@ -225,10 +232,28 @@ function detectSection(rawText: string): string {
   return "unknown";
 }
 
+function getBestSlideText(slide: ExtractedSlide): string {
+  const candidates = [
+    slide.finalText,
+    slide.ocrText,
+    slide.rawText,
+    slide.text,
+    slide.title,
+  ];
+
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return normalizeText(value);
+    }
+  }
+
+  return "";
+}
+
 function buildDeckSummaryObject(slides: ExtractedSlide[]): DeckSummary {
   const joined = slides.map((s) => getBestSlideText(s)).join("\n\n");
   const lower = joined.toLowerCase();
-  const oneLiner = pickFirstSentence(getBestSlideText(slides[0] ?? { index: 0, rawText: "" } as ExtractedSlide), 140);
+  const oneLiner = pickFirstSentence(getBestSlideText(slides[0] ?? ({ index: 0, rawText: "" } as ExtractedSlide)), 140);
 
   const problem = /problem|pain|challenge/.test(lower)
     ? findSnippet(joined, /(problem|pain|challenge)/i, 160)
@@ -347,6 +372,7 @@ const PitchRoom = () => {
   const [vcVideoMode, setVcVideoMode] = useState<"avatar" | "lip-sync">("avatar");
   const lipSyncAbortRef = useRef<AbortController | null>(null);
   const vcVideoUrlRef = useRef<string | null>(null);
+  const vcReplySeqRef = useRef<number>(0);
 
   // Fallback loop video ref + state
   const vcFallbackVideoRef = useRef<HTMLVideoElement>(null);
@@ -373,6 +399,12 @@ const PitchRoom = () => {
   const finalTextRef = useRef<string>("");
   const interimTextRef = useRef<string>("");
   const lastFinalAtRef = useRef<number>(0);
+  const lastConfidenceRef = useRef<number>(0);
+  const sawIsFinalRef = useRef<boolean>(false);
+  const sawSpeechFinalRef = useRef<boolean>(false);
+  const highConfidenceStableRef = useRef<boolean>(false);
+  const stableInterimCountRef = useRef<number>(0);
+  const lastStableInterimRef = useRef<string>("");
 
   // Auto VC reply scheduler refs (per spec)
   const lastTranscriptUpdateAtRef = useRef<number>(0);
@@ -389,6 +421,13 @@ const PitchRoom = () => {
   const talkStateRef = useRef<TalkState>(talkState);
   const inCallRef = useRef<boolean>(inCall);
   const sttStatusRef = useRef<typeof sttStatus>(sttStatus);
+
+  const SILENCE_TRIGGER_MS = 1000;
+  const FINAL_DEBOUNCE_MS = 300;
+  const STABLE_DEBOUNCE_MS = 500;
+  const MIN_TURN_CHARS = 6;
+  const HIGH_CONFIDENCE_THRESHOLD = 0.86;
+  const STABLE_INTERIM_HITS_REQUIRED = 2;
 
   useEffect(() => {
     callTurnStateRef.current = callTurnState;
@@ -422,7 +461,7 @@ const PitchRoom = () => {
         if (loaded >= total) setVcLoopReady(true);
       };
       v.onerror = () => {
-        // File missing — mark ready so we fall back to icon gracefully
+        // File missing ? mark ready so we fall back to icon gracefully
         loaded++;
         if (loaded >= total) setVcLoopReady(true);
       };
@@ -536,6 +575,38 @@ const PitchRoom = () => {
     return `${m.toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
   };
 
+  const attachStreamToVideo = useCallback(async (videoEl: HTMLVideoElement | null, stream: MediaStream | null) => {
+    if (!videoEl || !stream) return;
+    if (videoEl.srcObject !== stream) {
+      videoEl.srcObject = stream;
+    }
+
+    videoEl.autoplay = true;
+    videoEl.playsInline = true;
+    videoEl.muted = true;
+
+    try {
+      await videoEl.play();
+    } catch (err) {
+      // muted+autoplay should work in most browsers, but keep a diagnostic if blocked.
+      console.debug("[camera] video.play() blocked", err);
+    }
+  }, []);
+
+  const bindCameraVideoRef = useCallback((el: HTMLVideoElement | null) => {
+    videoRef.current = el;
+    if (el && streamRef.current) {
+      void attachStreamToVideo(el, streamRef.current);
+    }
+  }, [attachStreamToVideo]);
+
+  useEffect(() => {
+    if (!isCameraOn) return;
+    if (!videoRef.current) return;
+    if (!streamRef.current) return;
+    void attachStreamToVideo(videoRef.current, streamRef.current);
+  }, [isCameraOn, isSessionActive, phase, attachStreamToVideo]);
+
   const toggleCamera = useCallback(async () => {
     if (!inCall) {
       toast({
@@ -549,21 +620,28 @@ const PitchRoom = () => {
       const tracks = streamRef.current?.getTracks?.() ?? [];
       tracks.forEach((t) => t.stop());
       streamRef.current = null;
-      if (videoRef.current) videoRef.current.srcObject = null;
+      if (videoRef.current) {
+        try {
+          videoRef.current.pause();
+        } catch {
+          // ignore
+        }
+        videoRef.current.srcObject = null;
+      }
       setIsCameraOn(false);
     } else {
       try {
         console.log("[talk] request camera");
         const stream = await navigator.mediaDevices.getUserMedia({ video: true });
         streamRef.current = stream;
-        if (videoRef.current) videoRef.current.srcObject = stream;
         setIsCameraOn(true);
+        await attachStreamToVideo(videoRef.current, stream);
       } catch (err) {
         console.error("Camera access denied", err);
         toast({ variant: "destructive", title: "Camera permission denied" });
       }
     }
-  }, [inCall, isCameraOn]);
+  }, [attachStreamToVideo, inCall, isCameraOn]);
 
   const createDraftSession = useCallback((): Session => {
     const now = new Date().toISOString();
@@ -768,7 +846,9 @@ const PitchRoom = () => {
       vcVideoRef.current.src = "";
     }
     if (vcVideoUrlRef.current) {
-      try { URL.revokeObjectURL(vcVideoUrlRef.current); } catch { /* ignore */ }
+      if (vcVideoUrlRef.current.startsWith("blob:")) {
+        try { URL.revokeObjectURL(vcVideoUrlRef.current); } catch { /* ignore */ }
+      }
       vcVideoUrlRef.current = null;
     }
     setVcVideoMode("avatar");
@@ -852,51 +932,75 @@ const PitchRoom = () => {
   );
 
   const maybeAutoTriggerVcReply = useCallback(async () => {
-    const AUTO_MS = 1200;
-
     const state = callTurnStateRef.current;
     const vcBusy = vcBusyRef.current || talkStateRef.current === "thinking" || talkStateRef.current === "speaking";
-    const idleMs = Date.now() - lastTranscriptUpdateAtRef.current;
-    // Build committedText from accumulated buffers (NOT pendingUserTextRef)
+    const now = Date.now();
+    const idleMs = now - lastTranscriptUpdateAtRef.current;
     const committedText = normalizeText((finalTextRef.current + " " + interimTextRef.current).trim());
     const pendingLen = committedText.length;
+    const hasFinalSignal = sawIsFinalRef.current || sawSpeechFinalRef.current;
+    const hasStableSignal = highConfidenceStableRef.current;
+    const silenceQualified = idleMs >= SILENCE_TRIGGER_MS;
+    const hasCompletionSignal = hasFinalSignal || hasStableSignal || silenceQualified;
+    const debounceSatisfied = hasFinalSignal
+      ? idleMs >= FINAL_DEBOUNCE_MS
+      : hasStableSignal
+        ? idleMs >= STABLE_DEBOUNCE_MS
+        : silenceQualified;
 
     if (state !== "listening") {
-      console.debug("[AUTO]", "blocked", { reason: "state", state, vcBusy, idleMs, pendingLen });
+      console.debug("[AUTO]", "blocked", { reason: "state", state, vcBusy, idleMs, pendingLen, hasFinalSignal, hasStableSignal });
       return;
     }
 
     if (!autoEnabledRef.current) {
-      console.debug("[AUTO]", "blocked", { reason: "disabled", state, vcBusy, idleMs, pendingLen });
+      console.debug("[AUTO]", "blocked", { reason: "disabled", state, vcBusy, idleMs, pendingLen, hasFinalSignal, hasStableSignal });
       return;
     }
 
     if (vcBusy) {
-      console.debug("[AUTO]", "blocked", { reason: "vcBusy", state, vcBusy, idleMs, pendingLen });
+      console.debug("[AUTO]", "blocked", { reason: "vcBusy", state, vcBusy, idleMs, pendingLen, hasFinalSignal, hasStableSignal });
       return;
     }
 
-    if (idleMs < AUTO_MS) {
-      console.debug("[AUTO]", "blocked", { reason: "notIdle", state, vcBusy, idleMs, pendingLen });
+    if (pendingLen < MIN_TURN_CHARS) {
+      console.debug("[AUTO]", "blocked", { reason: "tooShort", state, vcBusy, idleMs, pendingLen, hasFinalSignal, hasStableSignal });
       return;
     }
 
-    if (pendingLen < 3) {
-      console.debug("[AUTO]", "blocked", { reason: "tooShort", state, vcBusy, idleMs, pendingLen });
+    if (!hasCompletionSignal) {
+      console.debug("[AUTO]", "blocked", { reason: "noCompletionSignal", state, vcBusy, idleMs, pendingLen, hasFinalSignal, hasStableSignal });
+      return;
+    }
+
+    if (!debounceSatisfied) {
+      console.debug("[AUTO]", "blocked", { reason: "debounce", state, vcBusy, idleMs, pendingLen, hasFinalSignal, hasStableSignal });
       return;
     }
 
     if (committedText === lastAutoReplyFingerprintRef.current) {
-      console.debug("[AUTO]", "blocked", { reason: "sameText", state, vcBusy, idleMs, pendingLen });
+      console.debug("[AUTO]", "blocked", { reason: "sameText", state, vcBusy, idleMs, pendingLen, hasFinalSignal, hasStableSignal });
       return;
     }
 
     lastAutoReplyFingerprintRef.current = committedText;
-    console.info("[TURN_COMMIT]", { len: committedText.length, preview: committedText.slice(0, 60) });
+    console.info("[TURN_COMMIT]", {
+      len: committedText.length,
+      preview: committedText.slice(0, 60),
+      hasFinalSignal,
+      hasStableSignal,
+      silenceQualified,
+      confidence: lastConfidenceRef.current,
+    });
 
-    // Clear both buffers BEFORE commit
+    // Clear buffers and completion signals BEFORE commit.
     finalTextRef.current = "";
     interimTextRef.current = "";
+    sawIsFinalRef.current = false;
+    sawSpeechFinalRef.current = false;
+    highConfidenceStableRef.current = false;
+    stableInterimCountRef.current = 0;
+    lastStableInterimRef.current = "";
     pendingUserTextRef.current = "";
     setCurrentDraftText("");
 
@@ -905,18 +1009,35 @@ const PitchRoom = () => {
   }, [commitUserTurnOnce, triggerVcFromText]);
 
   const scheduleAutoVcReply = useCallback(() => {
-    const AUTO_MS = 1200;
     const state = callTurnStateRef.current;
     const vcBusy = vcBusyRef.current || talkStateRef.current === "thinking" || talkStateRef.current === "speaking";
-    const idleMs = Date.now() - lastTranscriptUpdateAtRef.current;
+    const now = Date.now();
+    const idleMs = now - lastTranscriptUpdateAtRef.current;
     const pendingLen = (finalTextRef.current + " " + interimTextRef.current).trim().length;
+    const hasFinalSignal = sawIsFinalRef.current || sawSpeechFinalRef.current;
+    const hasStableSignal = highConfidenceStableRef.current;
+    const targetMs = hasFinalSignal
+      ? FINAL_DEBOUNCE_MS
+      : hasStableSignal
+        ? STABLE_DEBOUNCE_MS
+        : SILENCE_TRIGGER_MS;
+    const delayMs = Math.max(60, targetMs - idleMs);
 
-    console.debug("[AUTO]", "schedule", { state, vcBusy, idleMs, pendingLen, AUTO_MS });
+    console.debug("[AUTO]", "schedule", {
+      state,
+      vcBusy,
+      idleMs,
+      pendingLen,
+      hasFinalSignal,
+      hasStableSignal,
+      targetMs,
+      delayMs,
+    });
 
     clearPendingSilenceTimer();
     autoReplyTimerRef.current = window.setTimeout(() => {
       void maybeAutoTriggerVcReply();
-    }, AUTO_MS);
+    }, delayMs);
   }, [clearPendingSilenceTimer, maybeAutoTriggerVcReply]);
 
   const stopCall = useCallback(() => {
@@ -937,6 +1058,12 @@ const PitchRoom = () => {
     finalTextRef.current = "";
     interimTextRef.current = "";
     lastFinalAtRef.current = 0;
+    lastConfidenceRef.current = 0;
+    sawIsFinalRef.current = false;
+    sawSpeechFinalRef.current = false;
+    highConfidenceStableRef.current = false;
+    stableInterimCountRef.current = 0;
+    lastStableInterimRef.current = "";
     lastFinalRef.current = "";
     setCurrentDraftText("");
     setTalkState("idle");
@@ -1045,8 +1172,12 @@ const PitchRoom = () => {
     setTalkState("thinking");
     setCallTurnState("thinking");
     try {
+      const requestSeq = vcReplySeqRef.current + 1;
+      vcReplySeqRef.current = requestSeq;
       console.log("Calling /api/vc-reply");
-      let vcText = await fetchVcReply(utterance);
+      let vcReply = await fetchVcReply(utterance);
+      let vcText = vcReply.text;
+      let vcVideoUrl = vcReply.videoUrl;
       console.log("VC reply received");
 
       // One-shot anti-repeat guard.
@@ -1059,7 +1190,9 @@ const PitchRoom = () => {
           (prev === next || prev.includes(next) || next.includes(prev) || prev.slice(0, 60) === next.slice(0, 60));
         if (looksSame) {
           console.log("VC reply too similar; retrying once");
-          vcText = await fetchVcReply(`${utterance}\nAvoid repeating: "${lastVcTextRef.current}"`);
+          vcReply = await fetchVcReply(`${utterance}\nAvoid repeating: "${lastVcTextRef.current}"`);
+          vcText = vcReply.text;
+          vcVideoUrl = vcReply.videoUrl;
           console.log("VC reply received (retry)");
         }
       } catch {
@@ -1073,7 +1206,7 @@ const PitchRoom = () => {
         setTalkState("speaking");
         setCallTurnState("speaking");
         console.log("Calling /api/tts");
-        await speakVcText(vcText);
+        await speakVcText(vcText, { preferredVideoUrl: vcVideoUrl, requestSeq });
         console.log("VC audio playing");
       } catch (err) {
         const message = err instanceof Error ? err.message : "TTS error";
@@ -1132,7 +1265,7 @@ const PitchRoom = () => {
   }
 
   const fetchVcReply = useCallback(
-    async (lastUserText: string): Promise<string> => {
+    async (lastUserText: string): Promise<VcReplyResult> => {
       const persona = selectedPersona.id;
       const history = (activeSession?.transcript ?? []).slice(-8).map((m) => ({ role: m.role, content: m.content }));
       const sessionId = activeSession?.id ?? activeSessionId ?? undefined;
@@ -1159,17 +1292,89 @@ const PitchRoom = () => {
         throw new Error(`VC reply failed: ${resp.status} ${t}`.trim());
       }
       const json = (await resp.json().catch(() => null)) as unknown;
+      console.log("[talk] vc-reply json", json);
       const vcText = typeof (json as any)?.text === "string" ? String((json as any).text) : "";
+      const videoUrl =
+        typeof (json as any)?.video === "string"
+          ? String((json as any).video).trim()
+          : typeof (json as any)?.videoUrl === "string"
+            ? String((json as any).videoUrl).trim()
+            : "";
       if (!vcText.trim()) throw new Error("VC reply was empty");
       console.log("VC reply received");
-      return vcText.trim();
+      if (!videoUrl) {
+        console.warn("[talk] vc-reply missing video url field (expected `video` or `videoUrl`)");
+      }
+      return { text: vcText.trim(), videoUrl: videoUrl || undefined };
     },
     [activeSession?.transcript, activeSession?.id, activeSession?.deckSummary, activeSessionId, selectedPersona.id]
   );
 
+  const logVideoUrlHttpError = useCallback(async (videoUrl: string) => {
+    try {
+      const response = await fetch(videoUrl, {
+        method: "HEAD",
+        cache: "no-store",
+      });
+
+      if (response.status === 403 || response.status === 404) {
+        console.error("[lip-sync] video URL not accessible", {
+          status: response.status,
+          url: videoUrl,
+        });
+      }
+    } catch (err) {
+      // Cross-origin HEAD checks may be blocked. Keep this diagnostic non-fatal.
+      console.debug("[lip-sync] video URL HEAD check skipped", err);
+    }
+  }, []);
+
+  const setLipSyncVideoFromUrl = useCallback(async (videoUrlRaw: string, requestSeq: number): Promise<boolean> => {
+    const videoUrl = normalizeText(videoUrlRaw);
+    if (!videoUrl) {
+      console.error("[lip-sync] missing data.video from backend response");
+      return false;
+    }
+    if (requestSeq !== vcReplySeqRef.current) {
+      console.debug("[lip-sync] stale video url ignored", { requestSeq, latest: vcReplySeqRef.current });
+      return false;
+    }
+
+    const domEl = document.getElementById(AI_AVATAR_VIDEO_ID);
+    const el = domEl instanceof HTMLVideoElement ? domEl : vcVideoRef.current;
+    if (!el || !document.body.contains(el)) {
+      console.error("[lip-sync] avatar video element not found in DOM", { elementId: AI_AVATAR_VIDEO_ID });
+      return false;
+    }
+
+    try { el.pause(); } catch { /* ignore */ }
+
+    el.controls = true;
+    el.autoplay = true;
+    el.muted = true;
+    el.playsInline = true;
+    el.src = videoUrl;
+    el.load();
+    vcVideoUrlRef.current = videoUrl;
+    setVcVideoMode("lip-sync");
+
+    void logVideoUrlHttpError(videoUrl);
+
+    try {
+      await el.play();
+      return true;
+    } catch (err) {
+      console.warn("[lip-sync] autoplay failed; controls enabled for manual play", err);
+      return false;
+    }
+  }, [logVideoUrlHttpError]);
+
   const speakVcText = useCallback(
-    async (vcText: string) => {
+    async (vcText: string, options?: { preferredVideoUrl?: string; requestSeq?: number }) => {
       cleanupVcAudio();
+
+      const requestSeq = options?.requestSeq ?? vcReplySeqRef.current;
+      const preferredVideoUrl = normalizeText(options?.preferredVideoUrl ?? "");
 
       const started = performance.now();
 
@@ -1192,6 +1397,13 @@ const PitchRoom = () => {
       const latency = Math.round(performance.now() - started);
       console.log("[talk] tts latency ms", latency);
 
+      // Use backend-provided D-ID URL first when available.
+      if (preferredVideoUrl) {
+        await setLipSyncVideoFromUrl(preferredVideoUrl, requestSeq);
+      } else {
+        console.warn("[lip-sync] backend response missing video url; falling back to /api/vc-video");
+      }
+
       // --- Fire non-blocking lip-sync fetch in parallel ---
       try {
         lipSyncAbortRef.current?.abort();
@@ -1213,46 +1425,66 @@ const PitchRoom = () => {
         reader.readAsDataURL(blob);
       });
 
-      // Fire lip-sync request (non-blocking — does NOT affect audio playback)
-      void (async () => {
-        try {
-          const b64 = await audioBase64Promise;
-          if (!b64 || lipSyncAbort.signal.aborted) return;
+      // Fire lip-sync request (non-blocking; does NOT affect audio playback)
+      if (!preferredVideoUrl) {
+        void (async () => {
+          try {
+            const b64 = await audioBase64Promise;
+            if (!b64 || lipSyncAbort.signal.aborted) return;
+            if (requestSeq !== vcReplySeqRef.current) return;
 
-          const videoResp = await fetch("/api/vc-video", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ personaId: selectedPersona.id, audioBase64: b64 }),
-            signal: lipSyncAbort.signal,
-          });
+            const videoResp = await fetch("/api/vc-video", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ personaId: selectedPersona.id, audioBase64: b64 }),
+              signal: lipSyncAbort.signal,
+            });
 
-          if (!videoResp.ok || lipSyncAbort.signal.aborted) return;
-          const videoJson = (await videoResp.json().catch(() => null)) as any;
-          const videoUrl = typeof videoJson?.videoUrl === "string" ? videoJson.videoUrl : "";
-          if (!videoUrl || lipSyncAbort.signal.aborted) return;
+            if (!videoResp.ok || lipSyncAbort.signal.aborted) {
+              const errBody = await videoResp.text().catch(() => "");
+              if (videoResp.status === 403 || videoResp.status === 404) {
+                console.error("[lip-sync] /api/vc-video network error", {
+                  status: videoResp.status,
+                  body: errBody,
+                });
+              } else {
+                console.error("[lip-sync] /api/vc-video failed", {
+                  status: videoResp.status,
+                  body: errBody,
+                });
+              }
+              return;
+            }
+            const data = (await videoResp.json().catch(() => null)) as any;
+            console.log("[lip-sync] /api/vc-video json", data);
 
-          // Only use lip-sync if it arrived within ~1200ms of audio start
-          const elapsed = Date.now() - audioPlayStarted;
-          if (elapsed > 1200) {
-            console.debug("[lip-sync] video arrived too late", { elapsed });
-            return;
+            if (typeof data?.video !== "string" || !data.video.trim()) {
+              console.error("[lip-sync] backend issue: data.video missing", data);
+              return;
+            }
+
+            const videoUrl = data.video.trim();
+            if (!videoUrl || lipSyncAbort.signal.aborted) {
+              return;
+            }
+
+            // Only use lip-sync if it arrived within ~1200ms of audio start
+            const elapsed = Date.now() - audioPlayStarted;
+            if (elapsed > 1200) {
+              console.debug("[lip-sync] video arrived too late", { elapsed });
+              return;
+            }
+
+            const played = await setLipSyncVideoFromUrl(videoUrl, requestSeq);
+            if (played) {
+              console.info("[lip-sync] playing", { elapsed, cached: !!data?.cached });
+            }
+          } catch (err: any) {
+            if (err?.name === "AbortError") return;
+            console.debug("[lip-sync] failed, using fallback", err);
           }
-
-          // Switch to lip-sync video
-          if (vcVideoRef.current) {
-            vcVideoRef.current.src = videoUrl;
-            vcVideoRef.current.muted = true;
-            vcVideoRef.current.play().catch(() => { /* fallback stays */ });
-            vcVideoUrlRef.current = videoUrl;
-            setVcVideoMode("lip-sync");
-            console.info("[lip-sync] playing", { elapsed, cached: !!videoJson?.cached });
-          }
-        } catch (err: any) {
-          if (err?.name === "AbortError") return;
-          console.debug("[lip-sync] failed, using fallback", err);
-          // No action needed — fallback avatar stays visible
-        }
-      })();
+        })();
+      }
 
       if (!audioElRef.current) return;
       audioElRef.current.src = url;
@@ -1264,13 +1496,13 @@ const PitchRoom = () => {
         throw new Error("Audio playback failed");
       }
     },
-    [cleanupVcAudio, selectedPersona.id]
+    [cleanupVcAudio, selectedPersona.id, setLipSyncVideoFromUrl]
   );
 
   const startCall = useCallback(async () => {
     console.log("MIC ON clicked");
     if (inCall || sttStatus === "connecting") return;
-    console.log("Requesting mic…");
+    console.log("Requesting mic...");
     setCallError(null);
     setSttStatus("connecting");
     setTalkState("idle");
@@ -1289,6 +1521,12 @@ const PitchRoom = () => {
       finalTextRef.current = "";
       interimTextRef.current = "";
       lastFinalAtRef.current = 0;
+      lastConfidenceRef.current = 0;
+      sawIsFinalRef.current = false;
+      sawSpeechFinalRef.current = false;
+      highConfidenceStableRef.current = false;
+      stableInterimCountRef.current = 0;
+      lastStableInterimRef.current = "";
       lastFinalRef.current = "";
       pendingUtteranceRef.current = "";
       pendingUserTextRef.current = "";
@@ -1363,17 +1601,30 @@ const PitchRoom = () => {
       const wsUrl = import.meta.env.DEV ? "ws://localhost:8787/api/stt" : `${proto}://${window.location.host}/api/stt`;
       const ws = new WebSocket(wsUrl);
       dgWsRef.current = ws;
+      let wsOpened = false;
+      let terminalSttError: string | null = null;
+
+      const failSttStartup = (message: string) => {
+        if (terminalSttError) return;
+        terminalSttError = message;
+        console.error("STT startup failed:", message);
+        toast({ variant: "destructive", title: "STT connection failed", description: message });
+        setSttStatus("error");
+        setCallError(message);
+        cleanupLocal();
+      };
 
       const openTimeout = window.setTimeout(() => {
         if (ws.readyState === WebSocket.OPEN) return;
-        toast({ variant: "destructive", title: "STT connection failed" });
-        setSttStatus("error");
-        setCallError("STT connection failed");
-        cleanupLocal();
+        const message =
+          `WebSocket did not open in time (${wsUrl}, readyState=${ws.readyState}). ` +
+          "Make sure API server is running and /api/stt is reachable.";
+        failSttStartup(message);
       }, 3000);
 
       ws.onopen = () => {
         window.clearTimeout(openTimeout);
+        wsOpened = true;
         console.log("STT WS open");
         setSttStatus("ready");
         setInCall(true);
@@ -1456,15 +1707,22 @@ const PitchRoom = () => {
       ws.onerror = (e) => {
         window.clearTimeout(openTimeout);
         console.error("STT error", e);
-        toast({ variant: "destructive", title: "STT connection failed" });
-        setSttStatus("error");
-        setCallError("STT connection failed");
-        cleanupLocal();
+        const message =
+          `WebSocket error while connecting to ${wsUrl}. ` +
+          "Check API server status and browser network/proxy settings.";
+        failSttStartup(message);
       };
 
       ws.onclose = (e) => {
         window.clearTimeout(openTimeout);
-        console.log("STT closed", (e as CloseEvent)?.code, (e as CloseEvent)?.reason);
+        const code = (e as CloseEvent)?.code;
+        const reason = (e as CloseEvent)?.reason || "(no reason)";
+        console.log("STT closed", code, reason);
+        if (!wsOpened && !terminalSttError) {
+          const message = `STT socket closed before ready (code=${code}, reason=${reason})`;
+          failSttStartup(message);
+          return;
+        }
         setSttStatus((s) => (s === "idle" ? "idle" : "error"));
         setInCall(false);
         autoEnabledRef.current = false;
@@ -1472,6 +1730,12 @@ const PitchRoom = () => {
         finalTextRef.current = "";
         interimTextRef.current = "";
         lastFinalAtRef.current = 0;
+        lastConfidenceRef.current = 0;
+        sawIsFinalRef.current = false;
+        sawSpeechFinalRef.current = false;
+        highConfidenceStableRef.current = false;
+        stableInterimCountRef.current = 0;
+        lastStableInterimRef.current = "";
         lastFinalRef.current = "";
         pendingUtteranceRef.current = "";
         setCurrentDraftText("");
@@ -1509,13 +1773,22 @@ const PitchRoom = () => {
           const msgType = typeof msg?.type === "string" ? msg.type : "";
           const text = String(msg?.text ?? msg?.transcript ?? "").trim();
           const isFinal = Boolean(msg?.is_final ?? msg?.isFinal ?? msg?.final);
+          const speechFinal = Boolean(msg?.speech_final ?? msg?.speechFinal);
+          const rawConfidence = typeof msg?.confidence === "number"
+            ? msg.confidence
+            : Number(msg?.confidence);
+          const confidence = Number.isFinite(rawConfidence) ? rawConfidence : 0;
+          lastConfidenceRef.current = confidence;
 
-          console.log("STT parsed type=", msgType, "final=", isFinal, "textLen=", text.length);
+          console.log("STT parsed type=", msgType, "final=", isFinal, "speechFinal=", speechFinal, "confidence=", confidence, "textLen=", text.length);
 
           if (msgType === "error") {
             const message = String(msg?.message ?? "STT error");
+            console.error("STT backend error:", message);
             toast({ variant: "destructive", title: "STT error", description: message });
             setCallError(message);
+            setSttStatus("error");
+            cleanupLocal();
             return;
           }
 
@@ -1525,17 +1798,50 @@ const PitchRoom = () => {
           // --- Transcript buffering (per spec) ---
           lastTranscriptUpdateAtRef.current = Date.now();
 
-          if (isFinal) {
+          if (isFinal || speechFinal) {
             // Append finalized chunk to accumulated final text
             finalTextRef.current = (finalTextRef.current + " " + text).trim();
             interimTextRef.current = "";
             lastFinalAtRef.current = Date.now();
             lastFinalRef.current = text;
-            console.debug("[STT]", { isFinal: true, interimLen: 0, finalLen: finalTextRef.current.length });
+            sawIsFinalRef.current = sawIsFinalRef.current || isFinal;
+            sawSpeechFinalRef.current = sawSpeechFinalRef.current || speechFinal;
+            highConfidenceStableRef.current = false;
+            stableInterimCountRef.current = 0;
+            lastStableInterimRef.current = "";
+            console.debug("[STT]", {
+              isFinal,
+              speechFinal,
+              confidence,
+              interimLen: 0,
+              finalLen: finalTextRef.current.length,
+            });
           } else {
             // Interim: overwrite, do NOT accumulate
             interimTextRef.current = text;
-            console.debug("[STT]", { isFinal: false, interimLen: text.length, finalLen: finalTextRef.current.length });
+            const interimFingerprint = normalizeText(text).toLowerCase();
+            const highConfidence = confidence >= HIGH_CONFIDENCE_THRESHOLD;
+            if (highConfidence && interimFingerprint.length >= MIN_TURN_CHARS) {
+              if (interimFingerprint === lastStableInterimRef.current) {
+                stableInterimCountRef.current += 1;
+              } else {
+                lastStableInterimRef.current = interimFingerprint;
+                stableInterimCountRef.current = 1;
+              }
+            } else {
+              lastStableInterimRef.current = interimFingerprint;
+              stableInterimCountRef.current = 0;
+            }
+            highConfidenceStableRef.current = stableInterimCountRef.current >= STABLE_INTERIM_HITS_REQUIRED;
+            console.debug("[STT]", {
+              isFinal: false,
+              speechFinal: false,
+              confidence,
+              stableHits: stableInterimCountRef.current,
+              highConfidenceStable: highConfidenceStableRef.current,
+              interimLen: text.length,
+              finalLen: finalTextRef.current.length,
+            });
           }
 
           // Live display: full accumulated + latest interim
@@ -1709,11 +2015,11 @@ const PitchRoom = () => {
                 />
                 <div className="text-xs text-muted-foreground">
                   {isDeckProcessing ? (
-                    <span>Processing deck…</span>
+                    <span>Processing deck...</span>
                   ) : activeSession?.deckId ? (
                     <span>
-                      Deck uploaded ✔ · {(activeSession.extractedSlides ?? []).length} page(s)
-                      {deckFileName ? ` · ${deckFileName}` : ""}
+                      Deck uploaded OK - {(activeSession.extractedSlides ?? []).length} page(s)
+                      {deckFileName ? ` - ${deckFileName}` : ""}
                     </span>
                   ) : (
                     <span>PDF only. Text extraction is best-effort (image-only slides will be empty).</span>
@@ -1745,7 +2051,7 @@ const PitchRoom = () => {
           {/* Camera preview */}
           {isCameraOn && (
             <div className="mb-6 overflow-hidden rounded-xl border border-border">
-              <video ref={videoRef} autoPlay muted playsInline className="h-48 w-full object-cover" />
+              <video ref={bindCameraVideoRef} autoPlay muted playsInline className="h-48 w-full object-cover" />
             </div>
           )}
 
@@ -1773,16 +2079,16 @@ const PitchRoom = () => {
         </div>
         <div className="flex items-center gap-2">
           <span className="text-sm text-muted-foreground">
-            {selectedPersona.name} · {selectedPersona.style}
+            {selectedPersona.name} - {selectedPersona.style}
           </span>
           <div className="ml-3 flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">Context Loaded:</span>
             <span className="text-xs text-foreground">
-              Deck uploaded {activeSession?.deckId ? "✅" : "❌"}
+              Deck uploaded {activeSession?.deckId ? "YES" : "NO"}
               {activeSession?.deckId ? ` (${(activeSession.extractedSlides ?? []).length})` : ""}
             </span>
             <span className="text-xs text-foreground">
-              Memory ready {activeSession?.memoryLayer ? "✅" : "❌"}
+              Memory ready {activeSession?.memoryLayer ? "YES" : "NO"}
               {activeSession?.memoryLayer ? ` (${(activeSession.memoryLayer.unknownTopics ?? []).length})` : ""}
             </span>
             {activeSession?.memoryLayer ? (
@@ -1815,14 +2121,20 @@ const PitchRoom = () => {
             <div className="relative flex items-center justify-center overflow-hidden rounded-2xl border border-border bg-card">
               {/* Lip-sync video overlay (hidden unless mode=lip-sync) */}
               <video
+                id={AI_AVATAR_VIDEO_ID}
                 ref={vcVideoRef}
+                controls
+                autoPlay
                 muted
                 playsInline
                 className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-200 ${
                   vcVideoMode === "lip-sync" ? "opacity-100 z-10" : "opacity-0 z-0 pointer-events-none"
                 }`}
                 onError={() => {
-                  console.debug("[lip-sync] video error, reverting to avatar");
+                  const currentSrc = vcVideoRef.current?.currentSrc || vcVideoRef.current?.src || "";
+                  console.error("[lip-sync] video playback error", {
+                    src: currentSrc,
+                  });
                   setVcVideoMode("avatar");
                 }}
                 onEnded={() => {
@@ -1843,7 +2155,7 @@ const PitchRoom = () => {
                       : "opacity-0 z-0 pointer-events-none"
                 }`}
                 onError={() => {
-                  // Loop video missing or broken — icon fallback stays visible underneath
+                  // Loop video missing or broken ? icon fallback stays visible underneath
                   console.debug("[vc-loop] fallback video error");
                 }}
               />
@@ -1859,11 +2171,11 @@ const PitchRoom = () => {
                   <p className="text-xs text-muted-foreground">{selectedPersona.style}</p>
                   <p className="mt-2 text-xs text-muted-foreground">
                     {talkState === "speaking" || vcSpeaking
-                      ? "VC Speaking…"
+                      ? "VC Speaking..."
                       : talkState === "thinking" || isVcThinking
-                        ? "VC Thinking…"
+                        ? "VC Thinking..."
                         : talkState === "listening" || (inCall && sttStatus === "ready" && talkState === "idle")
-                          ? "Listening…"
+                          ? "Listening..."
                           : inCall
                             ? "In Call"
                             : ""}
@@ -1883,7 +2195,7 @@ const PitchRoom = () => {
             {/* Founder */}
             <div className="relative overflow-hidden rounded-2xl border border-border bg-card">
               {isCameraOn ? (
-                <video ref={videoRef} autoPlay muted playsInline className="h-full w-full object-cover" />
+                <video ref={bindCameraVideoRef} autoPlay muted playsInline className="h-full w-full object-cover" />
               ) : (
                 <div className="flex h-full items-center justify-center">
                   <div className="flex flex-col items-center gap-2 text-muted-foreground">
@@ -1905,7 +2217,7 @@ const PitchRoom = () => {
               onClick={() => void startCall()}
               disabled={inCall || sttStatus === "connecting"}
             >
-              {inCall && sttStatus === "ready" ? "Listening…" : sttStatus === "connecting" ? "Connecting…" : "Mic On"}
+              {inCall && sttStatus === "ready" ? "Listening..." : sttStatus === "connecting" ? "Connecting..." : "Mic On"}
             </Button>
             <Button variant="destructive" onClick={stopCall} disabled={!inCall}>
               Mic Off
@@ -1963,7 +2275,7 @@ const PitchRoom = () => {
                       >
                         <p className="mb-1 text-xs font-medium text-muted-foreground">
                           {msg.role === "vc" ? selectedPersona.name : "You"}
-                          {formatMsgTime(msg.timestamp) ? ` · ${formatMsgTime(msg.timestamp)}` : ""}
+                          {formatMsgTime(msg.timestamp) ? ` ? ${formatMsgTime(msg.timestamp)}` : ""}
                         </p>
                         {msg.content}
                       </div>
@@ -1973,7 +2285,7 @@ const PitchRoom = () => {
                 {currentDraftText.trim().length > 0 && (
                   <div className="flex gap-3 flex-row-reverse">
                     <div className="rounded-xl bg-secondary px-4 py-3 text-sm text-foreground opacity-80">
-                      <p className="mb-1 text-xs font-medium text-muted-foreground">You · speaking…</p>
+                      <p className="mb-1 text-xs font-medium text-muted-foreground">You - speaking...</p>
                       {currentDraftText}
                     </div>
                   </div>
@@ -1998,7 +2310,7 @@ const PitchRoom = () => {
                     Generate VC Question (Mock)
                   </Button>
                 </div>
-                {/* Force VC Reply button hidden – auto-trigger handles replies.
+                {/* Force VC Reply button hidden - auto-trigger handles replies.
                    forceVcReply() is still available programmatically for debugging. */}
                 <div className="flex gap-2">
                   <input
@@ -2007,7 +2319,7 @@ const PitchRoom = () => {
                     onKeyDown={(e) => {
                       if (e.key === "Enter") sendFounderMessage();
                     }}
-                    placeholder="Type your message…"
+                    placeholder="Type your message?"
                     className="h-10 flex-1 rounded-md border border-border bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   />
                   <Button type="button" variant="secondary" onClick={sendFounderMessage} disabled={!activeSessionId}>
@@ -2051,3 +2363,4 @@ const PitchRoom = () => {
 };
 
 export default PitchRoom;
+
