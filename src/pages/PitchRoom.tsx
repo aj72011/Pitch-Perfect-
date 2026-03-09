@@ -1598,7 +1598,9 @@ const PitchRoom = () => {
       console.log("Opening STT");
 
       const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      const wsUrl = import.meta.env.DEV ? "ws://localhost:8787/api/stt" : `${proto}://${window.location.host}/api/stt`;
+      const wsUrl = import.meta.env.DEV
+  ? "ws://localhost:8787/api/stt"
+  : "wss://pitch-perfect-production.up.railway.app/api/stt";
       const ws = new WebSocket(wsUrl);
       dgWsRef.current = ws;
       let wsOpened = false;
