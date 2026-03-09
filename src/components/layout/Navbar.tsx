@@ -14,7 +14,7 @@ const Navbar = () => {
             <Zap className="h-4 w-4 text-primary-foreground" />
           </div>
           <span className="text-lg font-bold tracking-tight text-foreground">
-            Pitch<span className="text-gradient-primary">VC</span> AI
+            Pitch<span className="text-gradient-primary">VC</span>
           </span>
         </Link>
 
