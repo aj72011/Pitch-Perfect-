@@ -1593,10 +1593,14 @@ const PitchRoom = () => {
     try {
       console.log("Opening STT");
 
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      const wsUrl = import.meta.env.DEV
-  ? "ws://localhost:8787/api/stt"
-  : "wss://pitch-perfect-production.up.railway.app/api/stt";
+      // Use environment variable for API URL, fallback to localhost for local dev
+      const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8787";
+      const WS_URL = API_URL
+        .replace("https://", "wss://")
+        .replace("http://", "ws://");
+      const wsUrl = `${WS_URL}/api/stt`;
+      
+      console.log("STT WebSocket connecting to:", wsUrl);
       const ws = new WebSocket(wsUrl);
       dgWsRef.current = ws;
       let wsOpened = false;
@@ -1623,7 +1627,7 @@ const PitchRoom = () => {
       ws.onopen = () => {
         window.clearTimeout(openTimeout);
         wsOpened = true;
-        console.log("STT WS open");
+        console.log("STT websocket connected successfully to", wsUrl);
         setSttStatus("ready");
         setInCall(true);
         setTalkState("listening");
@@ -1704,7 +1708,8 @@ const PitchRoom = () => {
 
       ws.onerror = (e) => {
         window.clearTimeout(openTimeout);
-        console.error("STT error", e);
+        console.error("STT websocket error:", e);
+        console.error("Failed to connect to:", wsUrl);
         const message =
           `WebSocket error while connecting to ${wsUrl}. ` +
           "Check API server status and browser network/proxy settings.";
@@ -1715,7 +1720,7 @@ const PitchRoom = () => {
         window.clearTimeout(openTimeout);
         const code = (e as CloseEvent)?.code;
         const reason = (e as CloseEvent)?.reason || "(no reason)";
-        console.log("STT closed", code, reason);
+        console.log("STT websocket closed:", { code, reason, url: wsUrl });
         if (!wsOpened && !terminalSttError) {
           const message = `STT socket closed before ready (code=${code}, reason=${reason})`;
           failSttStartup(message);
