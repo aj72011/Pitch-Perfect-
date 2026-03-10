@@ -21,8 +21,10 @@ const VALID_PERSONAS = new Set<string>(["shark", "analyst", "mentor", "operator"
 
 const DID_BASE_URL = "https://api.d-id.com";
 const DID_POLL_INTERVAL_MS = 1500;
-const DID_POLL_TIMEOUT_MS = 60_000;
-const DEFAULT_AVATAR_SOURCE = "https://d-id-public-bucket.s3.us-west-2.amazonaws.com/alice.jpg";
+const DID_POLL_TIMEOUT_MS = 60000;
+
+const DEFAULT_AVATAR_SOURCE =
+  "https://d-id-public-bucket.s3.us-west-2.amazonaws.com/alice.jpg";
 
 function getOptionalEnv(name: string): string | undefined {
   const v = process.env[name];
@@ -44,7 +46,6 @@ function safeParseJson(raw: string): unknown {
 }
 
 function didBasicAuthHeader(apiKey: string): string {
-  // Requirement: Authorization: Basic base64(DID_API_KEY + ":")
   const encoded = Buffer.from(`${apiKey}:`, "utf8").toString("base64");
   return `Basic ${encoded}`;
 }
@@ -63,17 +64,25 @@ async function resolveAudioBuffer(body: VcVideoRequest): Promise<Buffer | null> 
     }
 
     if (typeof body.audioUrl === "string" && body.audioUrl.trim().length > 0) {
-      const resp = await fetch(body.audioUrl.trim(), { signal: AbortSignal.timeout(10_000) });
+      const resp = await fetch(body.audioUrl.trim(), {
+        signal: AbortSignal.timeout(10000),
+      });
+
       if (!resp.ok) {
         const txt = await resp.text().catch(() => "");
-        console.error("[vc-video] audioUrl fetch failed", { status: resp.status, body: txt });
+        console.error("[vc-video] audioUrl fetch failed", {
+          status: resp.status,
+          body: txt,
+        });
         return null;
       }
+
       return Buffer.from(await resp.arrayBuffer());
     }
   } catch (err) {
     console.error("[vc-video] resolveAudioBuffer error", err);
   }
+
   return null;
 }
 
@@ -107,6 +116,7 @@ async function createDidTalk(
 
   const rawText = await response.text().catch(() => "");
   const parsed = safeParseJson(rawText);
+
   console.info("[vc-video][did][create] response", {
     status: response.status,
     body: parsed,
@@ -131,6 +141,7 @@ async function createDidTalk(
 export async function pollVideo(talkId: string, didApiKey: string): Promise<string> {
   const startedAt = Date.now();
   let lastStatus = "";
+
   const auth = didBasicAuthHeader(didApiKey);
 
   while (Date.now() - startedAt < DID_POLL_TIMEOUT_MS) {
@@ -144,7 +155,12 @@ export async function pollVideo(talkId: string, didApiKey: string): Promise<stri
 
     const rawText = await response.text().catch(() => "");
     const parsed = safeParseJson(rawText);
-    const statusRaw = typeof (parsed as any)?.status === "string" ? String((parsed as any).status) : "";
+
+    const statusRaw =
+      typeof (parsed as any)?.status === "string"
+        ? String((parsed as any).status)
+        : "";
+
     const status = statusRaw.toLowerCase();
 
     console.info("[vc-video][did][poll] response", {
@@ -164,6 +180,7 @@ export async function pollVideo(talkId: string, didApiKey: string): Promise<stri
         from: lastStatus || "(start)",
         to: status,
       });
+
       lastStatus = status;
     }
 
@@ -172,8 +189,8 @@ export async function pollVideo(talkId: string, didApiKey: string): Promise<stri
         typeof (parsed as any)?.result_url === "string"
           ? String((parsed as any).result_url).trim()
           : typeof (parsed as any)?.result?.url === "string"
-            ? String((parsed as any).result.url).trim()
-            : "";
+          ? String((parsed as any).result.url).trim()
+          : "";
 
       if (!resultUrl) {
         throw new Error("D-ID status=done but result_url is missing");
@@ -203,70 +220,72 @@ export function registerVcVideoRoute(app: express.Express) {
       const body = (req.body ?? {}) as VcVideoRequest;
 
       const didApiKey = getOptionalEnv("DID_API_KEY");
+
       if (!didApiKey) {
         return res.status(500).json({
           error: "DID_API_KEY missing",
           video: "",
           videoUrl: "",
           cached: false,
-        } satisfies VcVideoResponse);
+        });
       }
 
-      const avatarSource = getOptionalEnv("DID_AVATAR_SOURCE_URL") || DEFAULT_AVATAR_SOURCE;
+      const avatarSource =
+        getOptionalEnv("DID_AVATAR_SOURCE_URL") || DEFAULT_AVATAR_SOURCE;
 
-      const rawPersona = typeof body.personaId === "string" ? body.personaId.trim().toLowerCase() : "";
+      const rawPersona =
+        typeof body.personaId === "string"
+          ? body.personaId.trim().toLowerCase()
+          : "";
+
       const personaId: PersonaId = VALID_PERSONAS.has(rawPersona)
         ? (rawPersona as PersonaId)
         : "analyst";
 
       const audioBuf = await resolveAudioBuffer(body);
+
       if (!audioBuf || audioBuf.length === 0) {
         return res.status(400).json({
-          error: "Missing audio payload: provide audioBase64 or audioUrl",
+          error: "Missing audio payload",
           video: "",
           videoUrl: "",
           cached: false,
-        } satisfies VcVideoResponse);
+        });
       }
 
       const hash = computeHash(personaId, audioBuf);
       const cachedUrl = videoCache.get(hash);
+
       if (cachedUrl) {
-        console.info("[vc-video] cache hit", { hash: hash.slice(0, 12), personaId, video: cachedUrl });
         return res.status(200).json({
           video: cachedUrl,
           videoUrl: cachedUrl,
           cached: true,
-        } satisfies VcVideoResponse);
+        });
       }
 
       const create = await createDidTalk(audioBuf, didApiKey, avatarSource);
       const resultUrl = await pollVideo(create.talkId, didApiKey);
 
-      if (!resultUrl) {
-        throw new Error("pollVideo returned empty result URL");
-      }
-
       videoCache.set(hash, resultUrl);
 
-      const responsePayload: VcVideoResponse = {
+      return res.status(200).json({
         video: resultUrl,
         videoUrl: resultUrl,
         talkId: create.talkId,
         cached: false,
-      };
-
-      console.info("[vc-video] response payload", responsePayload);
-      return res.status(200).json(responsePayload);
+      });
     } catch (err) {
       const message = toErrorMessage(err);
-      console.error("[vc-video] unhandled error", err);
+
+      console.error("[vc-video] error", err);
+
       return res.status(502).json({
         error: message,
         video: "",
         videoUrl: "",
         cached: false,
-      } satisfies VcVideoResponse);
+      });
     }
   });
 }
