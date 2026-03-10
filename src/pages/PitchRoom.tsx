@@ -2120,7 +2120,7 @@ const PitchRoom = () => {
         {/* Video area */}
         <div className="flex flex-1 flex-col">
           <div className="grid flex-1 grid-cols-2 gap-3 p-4">
-            {/* AI VC */}
+            {/* VC */}
             <div className="relative flex items-center justify-center overflow-hidden rounded-2xl border border-border bg-card">
               {/* Lip-sync video overlay (hidden unless mode=lip-sync) */}
               <video
@@ -2186,7 +2186,7 @@ const PitchRoom = () => {
                 </div>
               </div>
               <div className="absolute bottom-3 left-3 z-20 rounded-md bg-secondary/80 px-2 py-1 text-xs font-medium text-foreground">
-                AI VC
+                VC
               </div>
               {callError ? (
                 <div className="absolute top-3 left-3 right-3 z-20 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">

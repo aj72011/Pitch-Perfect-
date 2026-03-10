@@ -37,7 +37,7 @@ const Hero = () => {
             className="mb-8 inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 px-4 py-2 text-sm text-primary"
           >
             <Brain className="h-4 w-4" />
-            AI-Powered Pitch Training
+            Intelligent Pitch Training
           </motion.div>
 
           <h1 className="mb-6 text-5xl font-extrabold leading-[1.1] tracking-tight text-foreground md:text-7xl">
@@ -48,7 +48,7 @@ const Hero = () => {
           </h1>
 
           <p className="mx-auto mb-10 max-w-2xl text-lg leading-relaxed text-muted-foreground md:text-xl">
-            Practice your startup pitch with a hyper-realistic AI venture capitalist. 
+            Practice your startup pitch with a hyper-realistic venture capitalist.
             Get brutally honest feedback, hard questions, and investor-grade scoring — all in real-time.
           </p>
 
@@ -76,7 +76,7 @@ const Hero = () => {
             {[
               { icon: Video, label: "Live Video Sessions", value: "Real-time" },
               { icon: Mic, label: "Voice Interaction", value: "Natural" },
-              { icon: Brain, label: "AI Feedback", value: "Instant" },
+              { icon: Brain, label: "Smart Feedback", value: "Instant" },
             ].map((stat) => (
               <div key={stat.label} className="flex items-center gap-3">
                 <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-secondary">

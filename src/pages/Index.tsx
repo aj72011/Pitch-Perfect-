@@ -21,10 +21,10 @@ const Index = () => {
             <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-primary">
               <Zap className="h-3.5 w-3.5 text-primary-foreground" />
             </div>
-            <span className="text-sm font-semibold text-foreground">PitchVC AI</span>
+            <span className="text-sm font-semibold text-foreground">PitchVC</span>
           </div>
           <p className="text-xs text-muted-foreground">
-            © 2026 PitchVC AI. Practice pitching. Raise smarter.
+            © 2026 PitchVC. Practice pitching. Raise smarter.
           </p>
         </div>
       </footer>

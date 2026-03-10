@@ -6,7 +6,7 @@ import { Link } from "react-router-dom";
 const steps = [
   { num: "01", title: "Set Up Your Profile", desc: "Enter your startup name, industry, stage, and funding goal." },
   { num: "02", title: "Choose Your VC", desc: "Select from multiple investor personas with unique styles." },
-  { num: "03", title: "Pitch Live", desc: "Activate your webcam and mic. Present your startup to the AI VC." },
+  { num: "03", title: "Pitch Live", desc: "Activate your webcam and mic. Present your startup to the VC." },
   { num: "04", title: "Get Scored", desc: "Receive detailed feedback, scores, and actionable improvements." },
 ];
 

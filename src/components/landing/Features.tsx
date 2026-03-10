@@ -11,8 +11,8 @@ import {
 const features = [
   {
     icon: MessageSquare,
-    title: "Live AI Conversation",
-    description: "Natural voice dialogue with an AI VC that interrupts, follows up, and challenges your claims in real time.",
+    title: "Live Conversation",
+    description: "Natural voice dialogue with a VC that interrupts, follows up, and challenges your claims in real time.",
   },
   {
     icon: BarChart3,
@@ -22,7 +22,7 @@ const features = [
   {
     icon: Target,
     title: "Dynamic Questions",
-    description: "AI generates questions based on your industry, stage, and claims. No two sessions are the same.",
+    description: "Questions are generated based on your industry, stage, and claims. No two sessions are the same.",
   },
   {
     icon: Shield,
