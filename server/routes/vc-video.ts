@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import type express from "express";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 type PersonaId = "shark" | "analyst" | "mentor" | "operator";
 
@@ -20,7 +21,7 @@ const videoCache = new Map<string, string>();
 const VALID_PERSONAS = new Set<string>(["shark", "analyst", "mentor", "operator"]);
 
 const DID_BASE_URL = "https://api.d-id.com";
-const DID_POLL_INTERVAL_MS = 1500;
+const DID_POLL_INTERVAL_MS = 800; // Reduced from 1500ms
 const DID_POLL_TIMEOUT_MS = 60000;
 
 const DEFAULT_AVATAR_SOURCE =
@@ -30,6 +31,14 @@ function getOptionalEnv(name: string): string | undefined {
   const v = process.env[name];
   const trimmed = typeof v === "string" ? v.trim() : "";
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function getRequiredEnv(name: string): string {
+  const v = getOptionalEnv(name);
+  if (!v) {
+    throw new Error(`Environment variable ${name} is required`);
+  }
+  return v;
 }
 
 function toErrorMessage(err: unknown): string {
@@ -86,23 +95,69 @@ async function resolveAudioBuffer(body: VcVideoRequest): Promise<Buffer | null> 
   return null;
 }
 
+/**
+ * Upload audio buffer to S3 and return a public HTTPS URL
+ */
+async function uploadAudioToS3(audioBuffer: Buffer): Promise<string> {
+  console.log("[vc-video] Uploading audio to S3");
+
+  const bucket = getRequiredEnv("S3_BUCKET");
+  const region = getRequiredEnv("AWS_REGION");
+  const accessKeyId = getRequiredEnv("AWS_ACCESS_KEY_ID");
+  const secretAccessKey = getRequiredEnv("AWS_SECRET_ACCESS_KEY");
+
+  const s3Client = new S3Client({
+    region,
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+    },
+  });
+
+  const filename = `audio-${crypto.randomUUID()}.mp3`;
+  const key = `vc-audio/${filename}`;
+
+  try {
+    const command = new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: audioBuffer,
+      ContentType: "audio/mpeg",
+      ACL: "public-read",
+    });
+
+    await s3Client.send(command);
+
+    const audioUrl = `https://${bucket}.s3.${region}.amazonaws.com/${key}`;
+    console.log("[vc-video] Audio URL:", audioUrl);
+
+    return audioUrl;
+  } catch (err) {
+    console.error("[vc-video] S3 upload failed:", err);
+    throw new Error(`Failed to upload audio to S3: ${toErrorMessage(err)}`);
+  }
+}
+
 async function createDidTalk(
   audioBuffer: Buffer,
   didApiKey: string,
   sourceUrl: string
 ): Promise<{ talkId: string; rawResponse: unknown }> {
-  const audioBase64 = audioBuffer.toString("base64");
+  // Upload audio to S3 first
+  const uploadedAudioUrl = await uploadAudioToS3(audioBuffer);
 
   const payload = {
     source_url: sourceUrl,
     script: {
       type: "audio",
-      audio_base64: audioBase64,
+      audio_url: uploadedAudioUrl,
     },
     config: {
       stitch: true,
     },
   };
+
+  console.log("[vc-video][did] Creating talk with audio_url:", uploadedAudioUrl);
 
   const response = await fetch(`${DID_BASE_URL}/talks`, {
     method: "POST",
@@ -123,6 +178,10 @@ async function createDidTalk(
   });
 
   if (!response.ok) {
+    console.error("[vc-video][did][create] failed", {
+      status: response.status,
+      response: rawText,
+    });
     throw new Error(`D-ID POST /talks failed: ${response.status} ${rawText}`.trim());
   }
 
@@ -144,6 +203,9 @@ export async function pollVideo(talkId: string, didApiKey: string): Promise<stri
 
   const auth = didBasicAuthHeader(didApiKey);
 
+  console.log("[vc-video][did][poll] Starting immediate polling for talkId:", talkId);
+
+  // Start polling immediately
   while (Date.now() - startedAt < DID_POLL_TIMEOUT_MS) {
     const response = await fetch(`${DID_BASE_URL}/talks/${encodeURIComponent(talkId)}`, {
       method: "GET",
@@ -171,6 +233,11 @@ export async function pollVideo(talkId: string, didApiKey: string): Promise<stri
     });
 
     if (!response.ok) {
+      console.error("[vc-video][did][poll] failed", {
+        talkId,
+        status: response.status,
+        response: rawText,
+      });
       throw new Error(`D-ID poll failed: ${response.status} ${rawText}`.trim());
     }
 
@@ -193,6 +260,7 @@ export async function pollVideo(talkId: string, didApiKey: string): Promise<stri
           : "";
 
       if (!resultUrl) {
+        console.error("[vc-video][did][done] result_url missing", { talkId, parsed });
         throw new Error("D-ID status=done but result_url is missing");
       }
 
@@ -205,11 +273,22 @@ export async function pollVideo(talkId: string, didApiKey: string): Promise<stri
     }
 
     if (status === "error" || status === "failed" || status === "rejected") {
+      console.error("[vc-video][did][error] terminal status", {
+        talkId,
+        status,
+        response: rawText,
+      });
       throw new Error(`D-ID returned terminal status=${status}: ${rawText}`.trim());
     }
 
     await new Promise((resolve) => setTimeout(resolve, DID_POLL_INTERVAL_MS));
   }
+
+  console.error("[vc-video][did][timeout]", {
+    talkId,
+    lastStatus,
+    timeoutMs: DID_POLL_TIMEOUT_MS,
+  });
 
   throw new Error(`D-ID polling timed out after ${DID_POLL_TIMEOUT_MS}ms for talkId=${talkId}`);
 }
@@ -222,6 +301,7 @@ export function registerVcVideoRoute(app: express.Express) {
       const didApiKey = getOptionalEnv("DID_API_KEY");
 
       if (!didApiKey) {
+        console.error("[vc-video] DID_API_KEY missing");
         return res.status(500).json({
           error: "DID_API_KEY missing",
           video: "",
@@ -245,6 +325,7 @@ export function registerVcVideoRoute(app: express.Express) {
       const audioBuf = await resolveAudioBuffer(body);
 
       if (!audioBuf || audioBuf.length === 0) {
+        console.error("[vc-video] Missing audio payload");
         return res.status(400).json({
           error: "Missing audio payload",
           video: "",
@@ -257,6 +338,7 @@ export function registerVcVideoRoute(app: express.Express) {
       const cachedUrl = videoCache.get(hash);
 
       if (cachedUrl) {
+        console.info("[vc-video] cache hit", { hash: hash.slice(0, 12), personaId, video: cachedUrl });
         return res.status(200).json({
           video: cachedUrl,
           videoUrl: cachedUrl,
@@ -264,10 +346,18 @@ export function registerVcVideoRoute(app: express.Express) {
         });
       }
 
+      console.log("[vc-video] Creating D-ID talk for persona:", personaId);
+
       const create = await createDidTalk(audioBuf, didApiKey, avatarSource);
       const resultUrl = await pollVideo(create.talkId, didApiKey);
 
       videoCache.set(hash, resultUrl);
+
+      console.info("[vc-video] success", {
+        personaId,
+        talkId: create.talkId,
+        videoUrl: resultUrl,
+      });
 
       return res.status(200).json({
         video: resultUrl,
@@ -278,7 +368,11 @@ export function registerVcVideoRoute(app: express.Express) {
     } catch (err) {
       const message = toErrorMessage(err);
 
-      console.error("[vc-video] error", err);
+      console.error("[vc-video] error", {
+        message,
+        error: err,
+        stack: err instanceof Error ? err.stack : undefined,
+      });
 
       return res.status(502).json({
         error: message,
