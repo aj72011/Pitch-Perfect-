@@ -29,16 +29,12 @@ export function registerTtsRoute(app: express.Express) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Accept: "audio/mpeg",
           "xi-api-key": apiKey,
+          Accept: "audio/mpeg",
         },
         body: JSON.stringify({
-          text,
+          text: text,
           model_id: modelId,
-          voice_settings: {
-            stability: 0.45,
-            similarity_boost: 0.8,
-          },
         }),
       });
 
