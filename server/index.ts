@@ -63,6 +63,38 @@ app.get("/api/health", (_req: express.Request, res: express.Response) => {
 app.get("/api/ping", (_req: express.Request, res: express.Response) => {
   res.json({ ok: true });
 });
+app.get("/debug/elevenlabs", async (_req: express.Request, res: express.Response) => {
+  try {
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+
+    if (!apiKey) {
+      return res.status(500).json({
+        ok: false,
+        error: "ELEVENLABS_API_KEY not set"
+      });
+    }
+
+    const response = await fetch("https://api.elevenlabs.io/v1/voices", {
+      headers: {
+        "xi-api-key": apiKey
+      }
+    });
+
+    const text = await response.text();
+
+    res.json({
+      ok: response.ok,
+      status: response.status,
+      body: text.substring(0, 500)
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : "Unknown error"
+    });
+  }
+});
 
 // Core API routes
 // registerVcReplyRoute(app); // Disabled: use /api/vc-turn in server.js instead
