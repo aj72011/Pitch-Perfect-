@@ -82,14 +82,13 @@ async function createDidTalk(
   didApiKey: string,
   sourceUrl: string
 ): Promise<{ talkId: string; rawResponse: unknown }> {
-  const audioDataUri = `data:audio/mpeg;base64,${audioBuffer.toString("base64")}`;
+  const audioBase64 = audioBuffer.toString("base64");
 
   const payload = {
     source_url: sourceUrl,
     script: {
       type: "audio",
-      audio_url: audioDataUri,
-      subtitles: false,
+      audio_base64: audioBase64,
     },
     config: {
       stitch: true,
