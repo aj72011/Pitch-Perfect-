@@ -5,7 +5,7 @@ import express from "express";
 import * as http from "http";
 import { attachSttWebSocket } from "./routes/stt.js";
 import { registerTtsRoute } from "./routes/tts.js";
-import { registerVcReplyRoute } from "./routes/vc-reply.js";
+// import { registerVcReplyRoute } from "./routes/vc-reply.js"; // Disabled: use /api/vc-turn in server.js instead
 import { registerVcVideoRoute } from "./routes/vc-video.js";
 
 function mustGetEnv(name: string): string {
@@ -65,7 +65,7 @@ app.get("/api/ping", (_req: express.Request, res: express.Response) => {
 });
 
 // Core API routes
-registerVcReplyRoute(app);
+// registerVcReplyRoute(app); // Disabled: use /api/vc-turn in server.js instead
 registerTtsRoute(app);
 registerVcVideoRoute(app);
 

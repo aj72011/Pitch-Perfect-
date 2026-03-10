@@ -921,7 +921,7 @@ const PitchRoom = () => {
 
       vcBusyRef.current = true;
       try {
-        console.debug("[AUTO]", "calling vc-reply");
+        console.debug("[AUTO]", "calling vc-turn");
         await handleFinalFounderUtterance(utterance);
         await waitForVcAudioToFinish();
       } finally {
@@ -1174,7 +1174,7 @@ const PitchRoom = () => {
     try {
       const requestSeq = vcReplySeqRef.current + 1;
       vcReplySeqRef.current = requestSeq;
-      console.log("Calling /api/vc-reply");
+      console.log("Calling /api/vc-turn");
       let vcReply = await fetchVcReply(utterance);
       let vcText = vcReply.text;
       let vcVideoUrl = vcReply.videoUrl;
@@ -1220,7 +1220,7 @@ const PitchRoom = () => {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
-      console.log("[talk] vc-reply error", message);
+      console.log("[talk] vc-turn error", message);
       if (message.toLowerCase().includes("aborted") || message.toLowerCase().includes("timeout")) {
         toast({
           variant: "destructive",
@@ -1275,35 +1275,31 @@ const PitchRoom = () => {
       const timeout = window.setTimeout(() => controller.abort(), 10_000);
       const started = performance.now();
 
-      console.log("Calling /api/vc-reply");
-      const resp = await fetch("/api/vc-reply", {
+      const API_URL = import.meta.env.VITE_API_URL || "";
+      console.log("Calling /api/vc-turn");
+      const resp = await fetch(`${API_URL}/api/vc-turn`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: lastUserText, history, persona, sessionId, deckSummary }),
+        body: JSON.stringify({ transcript: lastUserText, isFinalized: true }),
         signal: controller.signal,
       });
 
       window.clearTimeout(timeout);
       const latency = Math.round(performance.now() - started);
-      console.log("[talk] vc-reply latency ms", latency);
+      console.log("[talk] vc-turn latency ms", latency);
 
       if (!resp.ok) {
         const t = await resp.text().catch(() => "");
         throw new Error(`VC reply failed: ${resp.status} ${t}`.trim());
       }
       const json = (await resp.json().catch(() => null)) as unknown;
-      console.log("[talk] vc-reply json", json);
-      const vcText = typeof (json as any)?.text === "string" ? String((json as any).text) : "";
-      const videoUrl =
-        typeof (json as any)?.video === "string"
-          ? String((json as any).video).trim()
-          : typeof (json as any)?.videoUrl === "string"
-            ? String((json as any).videoUrl).trim()
-            : "";
+      console.log("[talk] vc-turn json", json);
+      const vcText = typeof (json as any)?.vcText === "string" ? String((json as any).vcText) : "";
+      const videoUrl = typeof (json as any)?.videoUrl === "string" ? String((json as any).videoUrl).trim() : "";
       if (!vcText.trim()) throw new Error("VC reply was empty");
       console.log("VC reply received");
       if (!videoUrl) {
-        console.warn("[talk] vc-reply missing video url field (expected `video` or `videoUrl`)");
+        console.warn("[talk] vc-turn missing video url field");
       }
       return { text: vcText.trim(), videoUrl: videoUrl || undefined };
     },
