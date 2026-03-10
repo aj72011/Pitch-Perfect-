@@ -18,8 +18,12 @@ export function registerTtsRoute(app: express.Express) {
 
     const voiceId = getOptionalEnv("ELEVENLABS_VOICE_ID") || "21m00Tcm4TlvDq8ikWAM";
     const modelId = (process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2").trim();
-
+    
     try {
+      console.log("TTS request text:", text);
+      console.log("TTS using voice ID:", voiceId);
+      console.log("TTS using model ID:", modelId);
+      
       const elevenUrl = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`;
       const upstream = await fetch(elevenUrl, {
         method: "POST",
@@ -40,6 +44,7 @@ export function registerTtsRoute(app: express.Express) {
 
       if (!upstream.ok) {
         const errText = await upstream.text().catch(() => "");
+        console.error("TTS ElevenLabs error:", upstream.status, errText);
         return res.status(502).json({ error: `ElevenLabs error: ${upstream.status} ${errText}`.trim() });
       }
 
@@ -47,11 +52,11 @@ export function registerTtsRoute(app: express.Express) {
       res.setHeader("Content-Type", "audio/mpeg");
       res.setHeader("Cache-Control", "no-store");
 
-      // eslint-disable-next-line no-console
-      console.log("TTS generated");
+      console.log("TTS generated successfully, audio size:", buf.length, "bytes");
       return res.status(200).send(buf);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
+      console.error("TTS error:", message);
       return res.status(500).json({ error: message });
     }
   });
