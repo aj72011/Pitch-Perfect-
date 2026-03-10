@@ -27,6 +27,14 @@ const DEEPGRAM_API_KEY = mustGetEnv("DEEPGRAM_API_KEY");
 
 const ELEVENLABS_MODEL_ID =
   process.env.ELEVENLABS_MODEL_ID?.trim() || "eleven_multilingual_v2";
+
+// Validate ElevenLabs configuration at startup
+console.log("ElevenLabs configuration:");
+console.log("  API key loaded:", !!ELEVENLABS_API_KEY);
+console.log("  API key length:", ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.length : 0);
+console.log("  Voice ID:", ELEVENLABS_VOICE_ID);
+console.log("  Model ID:", ELEVENLABS_MODEL_ID);
+
 const DID_AVATAR_SOURCE_URL =
   process.env.DID_AVATAR_SOURCE_URL?.trim() ||
   "https://d-id-public-bucket.s3.us-west-2.amazonaws.com/alice.jpg";
@@ -274,6 +282,11 @@ async function synthesizeWithElevenLabs(text) {
     throw new AppError("tts", "Missing text for ElevenLabs", 400);
   }
 
+  console.log("Calling ElevenLabs TTS");
+  console.log("  Voice ID:", ELEVENLABS_VOICE_ID);
+  console.log("  Model ID:", ELEVENLABS_MODEL_ID);
+  console.log("  Text length:", inputText.length);
+
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVENLABS_VOICE_ID)}`;
   const response = await fetch(url, {
     method: "POST",
@@ -294,6 +307,11 @@ async function synthesizeWithElevenLabs(text) {
 
   if (!response.ok) {
     const errText = await response.text().catch(() => "");
+    console.error("ElevenLabs API error:");
+    console.error("  Status:", response.status);
+    console.error("  Status Text:", response.statusText);
+    console.error("  Response Body:", errText);
+    console.error("  Using API key length:", ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.length : 0);
     throw new AppError("tts", `ElevenLabs error: ${response.status}`, 502, normalizeText(errText));
   }
 
@@ -301,6 +319,8 @@ async function synthesizeWithElevenLabs(text) {
   if (!audioBuffer.length) {
     throw new AppError("tts", "ElevenLabs returned empty audio", 502);
   }
+
+  console.log("ElevenLabs TTS successful, audio size:", audioBuffer.length, "bytes");
 
   return {
     audioBuffer,
@@ -721,12 +741,68 @@ app.get("/", (_req, res) => {
   res.status(200).json({
     ok: true,
     service: "VC simulation API",
-    endpoints: ["/api/health", "/api/vc-turn", "WS /api/stt"],
+    endpoints: ["/api/health", "/api/vc-turn", "WS /api/stt", "GET /debug/elevenlabs"],
   });
 });
 
 app.get("/api/health", (_req, res) => {
   res.status(200).json({ ok: true });
+});
+
+// Diagnostic endpoint to test ElevenLabs authentication
+app.get("/debug/elevenlabs", async (_req, res) => {
+  try {
+    console.log("Testing ElevenLabs authentication...");
+    console.log("  API key present:", !!ELEVENLABS_API_KEY);
+    console.log("  API key length:", ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.length : 0);
+    
+    const response = await fetch("https://api.elevenlabs.io/v1/voices", {
+      method: "GET",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+      },
+    });
+    
+    console.log("  Response status:", response.status);
+    console.log("  Response ok:", response.ok);
+    
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      console.error("  Error response:", errText);
+      return res.status(response.status).json({
+        ok: false,
+        status: response.status,
+        message: "ElevenLabs authentication failed",
+        details: errText,
+        config: {
+          apiKeyPresent: !!ELEVENLABS_API_KEY,
+          apiKeyLength: ELEVENLABS_API_KEY ? ELEVENLABS_API_KEY.length : 0,
+          voiceId: ELEVENLABS_VOICE_ID,
+          modelId: ELEVENLABS_MODEL_ID,
+        },
+      });
+    }
+    
+    const data = await response.json();
+    console.log("  Authentication successful, voices count:", data.voices?.length || 0);
+    
+    return res.status(200).json({
+      ok: true,
+      message: "ElevenLabs authentication successful",
+      voicesCount: data.voices?.length || 0,
+      config: {
+        voiceId: ELEVENLABS_VOICE_ID,
+        modelId: ELEVENLABS_MODEL_ID,
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    console.error("Diagnostic endpoint error:", message);
+    return res.status(500).json({
+      ok: false,
+      error: message,
+    });
+  }
 });
 
 // Direct HTTP endpoint for already-finalized transcript text.
